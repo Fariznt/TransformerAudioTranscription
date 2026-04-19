@@ -1,0 +1,9 @@
+./datasets
+datasets/
+datasets
+MAPS.zip
+scratch/
+context/
+*.zip
+__pycache__/
+.venv/
