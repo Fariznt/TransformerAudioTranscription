@@ -1,5 +1,7 @@
 """
-Role: Load and manage the MAPS dataset for training and evaluation.
+Role: Load and manage the MAPS dataset for training and evaluation. 
+Dev note: We might support MAESTRO in the same class in the future and share code for it.
+This will look like passing a dataset name as an argument to the constructor.
 """
 from typing import Dict, List, Tuple
 import json
@@ -10,24 +12,23 @@ from torch.utils.data import Dataset, DataLoader
 import src.data.midi_tokenizer as midi_tokenizer
 import src.data.audio_processor as audio_processor
 
-class MAPSDataset(Dataset):
+class AudioDataset(Dataset):
     """
     PyTorch Dataset wrapper for the MAPS dataset.
     This will read audio paths and MIDI paths from the MAPS json/csv index.
     """
-    def __init__(self, split: str = 'train', max_input_frames: int = 1024):
+    def __init__(self, split: str = 'train'):
         """
         ???
         """
         self.split = split # currently doesn't make a difference
-        self.max_input_frames = max_input_frames
 
         # hardcoded paths for now, potentially move to config file later
         self.index_file = Path("datasets/maps_index.jsonl")
         self._maps_root = Path("datasets/maps")
 
         # make sure file exists
-        manifest_path = self.index_file
+        manifest_path = Path(index_file)
         if not manifest_path.is_file():
             raise FileNotFoundError(f"MAPS manifest not found: {manifest_path}")
 
@@ -55,8 +56,6 @@ class MAPSDataset(Dataset):
         Return resolved WAV and MIDI paths for a dataset index.
         Hides manifest row/key semantics from __getitem__.
         """
-        if idx < 0:
-            idx += len(self.rows)
         if idx < 0 or idx >= len(self.rows):
             raise IndexError(f"Index out of range: {idx}")
 
@@ -78,17 +77,6 @@ class MAPSDataset(Dataset):
         - 'labels': Tokenized MIDI events
         """
         wav_path, mid_path = self.get_item_paths(idx)
-
-        # Load full audio feature sequence, then select a random contiguous segment.
-        full_audio_features = audio_processor.preprocess_audio_pipeline(str(wav_path), config=None)
-        total_frames = full_audio_features.shape[-1]
-        segment_max = min(self.max_input_frames, total_frames)
-        segment_len = random.randint(1, segment_max)
-        segment_start = random.randint(0, total_frames - segment_len)
-        audio_segment = full_audio_features[..., segment_start : segment_start + segment_len]
-
-        _ = mid_path
-        _ = audio_segment
         pass
 
 def create_dataloaders(batch_size: int) -> Tuple[DataLoader, DataLoader, DataLoader]:
