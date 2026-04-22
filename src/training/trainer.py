@@ -36,9 +36,3 @@ class MT3Trainer:
         The main loop. Handles checkpoint saving and logging per epoch.
         """
         pass
-
-    def save_checkpoint(self, path: str):
-        pass
-
-    def load_checkpoint(self, path: str):
-        pass
