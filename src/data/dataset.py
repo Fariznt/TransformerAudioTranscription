@@ -121,6 +121,8 @@ class AudioDataset(Dataset):
         (frames per full file) is much larger than 2000. The distribution
         over ``length`` conditional on being a boundary crop is unchanged.
         """
+        # TODO: current situation. this makes sense as a preprocessing pipeline, but fidelity
+        # is to be verified
         wav_path, mid_path = self.get_item_paths(idx)
 
         # load_audio returns a 1-D float32 tensor (num_samples,), mono, resampled.
@@ -129,30 +131,42 @@ class AudioDataset(Dataset):
         midi = pretty_midi.PrettyMIDI(str(mid_path))
 
         hop_width = config.hop_width
-        length = config.max_input_frames  # MT3's `max_length`; `min_length` is None -> fixed.
+        length = config.max_input_frames # MT3's `max_length`; `min_length` is None -> fixed i think
 
+        # TODO: verify padding is the next step here. ive checked that the padding logic makes sense
         # _audio_to_frames padding (MT3 `mt3/preprocessors.py`):
         #   samples = np.pad(samples, [0, frame_size - len(samples) % frame_size], mode='constant')
-        pad = hop_width - waveform.shape[-1] % hop_width
-        waveform = torch.nn.functional.pad(waveform, (0, pad))
+        num_samples = waveform.shape[-1]
+        # hop_width - leftover portion of waveform that doesn't fit into a hop-width length
+        # this is the amount of padding we need to add to the waveform to make it a multiple of hop_width
+        pad = hop_width - num_samples % hop_width 
+        # add 'pad' padding values (default 0) to the right, and 0 padding values to the left
+        waveform = torch.nn.functional.pad(waveform, (0, pad)) 
 
-        n_tokens = waveform.shape[-1] // hop_width
+        n_tokens = num_samples // hop_width # number of hop-width length segments in the padded waveform
 
+        # TODO: check if this code truly exists like this. ive verified the logic makes sense.
         # select_random_chunk with uniform_random_start=True (see
         # `single_example_select_random_chunk` in `t5/data/preprocessors.py`):
         #   start = uniform(-length + 1, n_tokens)
         #   end   = min(start + length, n_tokens)
         #   start = max(start, 0)
         # random.randint is inclusive on both ends, so use n_tokens - 1 as the upper bound.
-        start_frame = random.randint(-length + 1, n_tokens - 1)
-        end_frame = min(start_frame + length, n_tokens)
-        start_frame = max(start_frame, 0)
+        start_frame = random.randint(-length + 1, n_tokens - 1) # pick random start frame in waveform
+        # pick end frame so that segment is length-long or truncated at the end of the waveform
+        end_frame = min(start_frame + length, n_tokens) 
+        # clamp start frame to 0 so that we don't start before the beginning of the waveform
+        start_frame = max(start_frame, 0) #
 
+        # convert frame indices to sample indices
         start_sample = start_frame * hop_width
         end_sample = end_frame * hop_width
-        audio_segment = waveform[..., start_sample:end_sample]
+        audio_segment = waveform[..., start_sample:end_sample] # get audio segment from waveform
 
         # Window bounds in seconds; tokenizer trims/zeros event times to this range.
+        # convert sample indices to seconds so we can use it to tokenize the MIDI and keep
+        # the right part of the MIDI that corresponds to the audio segment
+        # (inside tokenizer.encode())
         start_time = start_sample / config.sample_rate
         end_time = end_sample / config.sample_rate
 
