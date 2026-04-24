@@ -1,30 +1,38 @@
 #!/usr/bin/env python3
-"""Prepare MAPS for training: unpack under ``datasets/maps/``, then write ``datasets/maps_index.jsonl``.
+"""Prepare MAPS for training: unpack under ``TrainingConfig.maps_root``, then write ``maps_index_path``.
 
-Paths are relative to **cwd** (run from the repo root).
+Dataset directories are taken from ``src.config`` (paths relative to **process cwd**,
+typically the repo root). See ``TrainingConfig.maps_root`` and ``maps_index_path``.
 
-1. If ``datasets/maps/`` is empty, unpack ``datasets/MAPS.zip`` into it.
-2. While there is any ``*.zip`` under ``datasets/maps/``, unpack it into the
+1. If ``maps_root`` is empty, unpack ``datasets/MAPS.zip`` into it.
+2. While there is any ``*.zip`` under ``maps_root``, unpack it into the
    **same directory as that zip** (nested layout from the distributor), then
    delete the zip so the next pass finds deeper content until ``.wav`` / ``.mid``
    appear at the MAPS leaves.
-3. Walk ``datasets/maps/``, pair each ``*.wav`` with same-stem ``.mid`` in the
-   same folder; write one JSON object per line to ``datasets/maps_index.jsonl``.
+3. Walk ``maps_root``, pair each ``*.wav`` with same-stem ``.mid`` in the
+   same folder; write one JSON object per line to ``maps_index_path``.
 
-Training code resolves ``row["mid"]`` under ``datasets/maps/`` and passes the
-path to ``pretty_midi.PrettyMIDI(...)``.
+Training code resolves ``row["wav"]`` / ``row["mid"]`` under ``maps_root`` and passes paths
+to loaders (e.g. ``pretty_midi.PrettyMIDI(...)``).
 
 Usage: ``python scripts/build_maps_manifest.py`` (with ``datasets/MAPS.zip`` present).
 """
 from __future__ import annotations
 
 import json
+import sys
 import zipfile
 from pathlib import Path
 
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from src.config import config
+
 MAPS_ZIP = Path("datasets/MAPS.zip")
-MAPS_DIR = Path("datasets/maps")
-MANIFEST = Path("datasets/maps_index.jsonl")
+MAPS_DIR = config.maps_root
+MANIFEST = config.maps_index_path
 
 
 def _unwrap_nested_zips(root: Path) -> None:
