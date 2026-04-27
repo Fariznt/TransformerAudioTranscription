@@ -1,6 +1,6 @@
 """
 This file defines the configurable training hyperparameters and data processing
-constants. It omits fixed model architecture details, focusing only on parameters 
+constants. It omits fixed model architecture details, focusing only on parameters
 that are meant to be tuned during the experimentation workflow.
 """
 from dataclasses import dataclass
@@ -31,7 +31,7 @@ class TrainingConfig:
     hop_width: int = 128 #how many samples we slide between positions.
     # Smaller hop = finer time resolution, but more columns = longer sequence = more memory.
     mel_n_fft: int = 2048 # FFT sliding window length in samples
-    mel_n_mels: int = 512 #  How many mel bands (frequency “bins” on the mel scale) you keep 
+    mel_n_mels: int = 512 #  How many mel bands (frequency "bins" on the mel scale) you keep
     # (more mels means more detail on freq axis)
     mel_f_min: float = 20.0 # lowest frequency to include in the mel spectrogram
     mel_log_floor: float = 1e-5 # Floor on linear magnitude before log (prevents near-zero values from blowing up)
@@ -42,6 +42,11 @@ class TrainingConfig:
     max_target_tokens: int = 1024
     pad_id: int = 0
     eos_id: int = 1
+
+    # --- MIDI / tokenizer parameters ---
+    midi_max: int = 127              # max value for MIDI pitch, velocity, program, drum pitch
+    drum_duration_s: float = 0.05   # fixed duration for drum hits at decode time
+    min_note_duration_s: float = 0.01  # minimum note duration enforced at decode time
 
     # --- Dataset layout (paths relative to process cwd, project root) ---
     # These paths are what are used for creating a manifest file from dataset, and loading the dataset
