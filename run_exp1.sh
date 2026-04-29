@@ -1,6 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=exp1_stft
 #SBATCH --time=08:00:00
+#SBATCH --partition=gpu
 #SBATCH --gres=gpu:1
 #SBATCH --mem=32G
 #SBATCH --output=logs/exp1_%j.log
