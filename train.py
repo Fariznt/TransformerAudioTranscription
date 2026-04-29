@@ -9,6 +9,8 @@ import argparse
 parser = argparse.ArgumentParser()
 parser.add_argument("--input_type", default="log_mel", choices=["log_mel", "stft"])
 parser.add_argument("--num_heads", type=int, default=6)
+parser.add_argument("--eval_only", default=None, metavar="CKPT_PATH",
+                    help="Skip training; load this checkpoint and run eval only.")
 args = parser.parse_args()
 import os, sys, json, math, random, time, gzip, pickle, urllib.request
 from dataclasses import dataclass, field
@@ -1161,6 +1163,10 @@ class PianoTranscriptionTransformer(nn.Module):
 
 
 model = PianoTranscriptionTransformer(config, vocab_size=VOCAB_SIZE_PADDED).to(device)
+if args.eval_only:
+    ckpt = torch.load(args.eval_only, map_location=device)
+    model.load_state_dict(ckpt["model"])
+    print(f"Loaded checkpoint from {args.eval_only}")
 n_params = sum(p.numel() for p in model.parameters())
 print(f"Model parameters: {n_params:,}  ({n_params/1e6:.1f}M)")
 # Paper reports ~54M. We come in ~45.6M because our shift vocabulary is 1001 values
@@ -1244,107 +1250,109 @@ def lr_at_step(step: int) -> float:
 print(f"Optimizer: Adafactor, lr={config.learning_rate}, warmup={config.warmup_steps} steps")
 
 
-train_loader = DataLoader(
-    train_ds, batch_size=config.batch_size, shuffle=False,
-    num_workers=0, pin_memory=(device.type == "cuda"), drop_last=True,
-)
+if not args.eval_only:
+    train_loader = DataLoader(
+        train_ds, batch_size=config.batch_size, shuffle=False,
+        num_workers=0, pin_memory=(device.type == "cuda"), drop_last=True,
+    )
+    
+    # torch.amp is the non-deprecated API (torch >= 2.0). Wrap in a try for older installs.
+    try:
+        scaler = torch.amp.GradScaler("cuda", enabled=(config.use_amp and device.type == "cuda"))
+        _amp_ctx = lambda: torch.amp.autocast("cuda", enabled=(config.use_amp and device.type == "cuda"), dtype=torch.float16)
+    except (AttributeError, TypeError):
+        scaler = torch.cuda.amp.GradScaler(enabled=(config.use_amp and device.type == "cuda"))
+        _amp_ctx = lambda: torch.cuda.amp.autocast(enabled=(config.use_amp and device.type == "cuda"), dtype=torch.float16)
+    
+    
+    def run_micro_batch(batch) -> Tuple[float, float]:
+        inputs  = batch["inputs"].to(device, non_blocking=True)
+        targets = batch["targets"].to(device, non_blocking=True)
+        dec_in  = shift_right(targets)
+        with _amp_ctx():
+            logits = model(inputs, dec_in)
+            loss, acc = compute_loss(
+                logits, targets,
+                z_loss_coef=config.z_loss,
+                label_smoothing=config.label_smoothing,
+            )
+            loss = loss / config.grad_accum
+        scaler.scale(loss).backward()
+        return loss.item() * config.grad_accum, acc.item()
+    
+    
+    history = {"step": [], "loss": [], "acc": [], "lr": []}
+    start_step = 0
+    latest_ckpt = CKPT_DIR / f"{config.input_type}_h{config.num_heads}_latest.pt"
+    if latest_ckpt.exists():
+        print(f"Resuming from {latest_ckpt}")
+        blob = torch.load(latest_ckpt, map_location=device)
+        model.load_state_dict(blob["model"])
+        optimizer.load_state_dict(blob["optimizer"])
+        start_step = blob["step"]
+        history = blob.get("history", history)
+        if "scaler" in blob:
+            scaler.load_state_dict(blob["scaler"])
+    
+    step = start_step
+    train_iter = iter(train_loader)
+    model.train()
+    
+    pbar = tqdm(initial=start_step, total=config.total_steps, desc="train")
+    running_loss, running_acc, n_log = 0.0, 0.0, 0
+    
+    while step < config.total_steps:
+        optimizer.zero_grad(set_to_none=True)
+        accum_loss, accum_acc = 0.0, 0.0
+        for _ in range(config.grad_accum):
+            try:
+                batch = next(train_iter)
+            except StopIteration:
+                train_iter = iter(train_loader)
+                batch = next(train_iter)
+            l, a = run_micro_batch(batch)
+            accum_loss += l; accum_acc += a
+        accum_loss /= config.grad_accum
+        accum_acc  /= config.grad_accum
+    
+        lr_now = lr_at_step(step)
+        for pg in optimizer.param_groups:
+            pg["lr"] = lr_now
+    
+        # Unscale so we can clip; then take the step.
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        scaler.step(optimizer)
+        scaler.update()
+    
+        step += 1; pbar.update(1)
+        running_loss += accum_loss; running_acc += accum_acc; n_log += 1
+    
+        if step % config.log_every == 0:
+            avg_loss = running_loss / n_log
+            avg_acc  = running_acc  / n_log
+            history["step"].append(step); history["loss"].append(avg_loss)
+            history["acc"].append(avg_acc); history["lr"].append(lr_now)
+            pbar.set_postfix(loss=f"{avg_loss:.3f}", acc=f"{avg_acc:.3f}", lr=f"{lr_now:.1e}")
+            running_loss, running_acc, n_log = 0.0, 0.0, 0
+    
+        if step % config.ckpt_every == 0 or step == config.total_steps:
+            torch.save({
+                "step": step,
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scaler": scaler.state_dict(),
+                "history": history,
+            }, latest_ckpt)
+    
+    pbar.close()
+    print("\nTraining complete.")
+    
+    
+    best_ckpt = CKPT_DIR / f"{config.input_type}_h{config.num_heads}_best.pt"
+    torch.save({"step": step, "model": model.state_dict(), "history": history}, best_ckpt)
+    print(f"Saved best checkpoint to {best_ckpt}")
 
-# torch.amp is the non-deprecated API (torch >= 2.0). Wrap in a try for older installs.
-try:
-    scaler = torch.amp.GradScaler("cuda", enabled=(config.use_amp and device.type == "cuda"))
-    _amp_ctx = lambda: torch.amp.autocast("cuda", enabled=(config.use_amp and device.type == "cuda"), dtype=torch.float16)
-except (AttributeError, TypeError):
-    scaler = torch.cuda.amp.GradScaler(enabled=(config.use_amp and device.type == "cuda"))
-    _amp_ctx = lambda: torch.cuda.amp.autocast(enabled=(config.use_amp and device.type == "cuda"), dtype=torch.float16)
-
-
-def run_micro_batch(batch) -> Tuple[float, float]:
-    inputs  = batch["inputs"].to(device, non_blocking=True)
-    targets = batch["targets"].to(device, non_blocking=True)
-    dec_in  = shift_right(targets)
-    with _amp_ctx():
-        logits = model(inputs, dec_in)
-        loss, acc = compute_loss(
-            logits, targets,
-            z_loss_coef=config.z_loss,
-            label_smoothing=config.label_smoothing,
-        )
-        loss = loss / config.grad_accum
-    scaler.scale(loss).backward()
-    return loss.item() * config.grad_accum, acc.item()
-
-
-history = {"step": [], "loss": [], "acc": [], "lr": []}
-start_step = 0
-latest_ckpt = CKPT_DIR / f"{config.input_type}_h{config.num_heads}_latest.pt"
-if latest_ckpt.exists():
-    print(f"Resuming from {latest_ckpt}")
-    blob = torch.load(latest_ckpt, map_location=device)
-    model.load_state_dict(blob["model"])
-    optimizer.load_state_dict(blob["optimizer"])
-    start_step = blob["step"]
-    history = blob.get("history", history)
-    if "scaler" in blob:
-        scaler.load_state_dict(blob["scaler"])
-
-step = start_step
-train_iter = iter(train_loader)
-model.train()
-
-pbar = tqdm(initial=start_step, total=config.total_steps, desc="train")
-running_loss, running_acc, n_log = 0.0, 0.0, 0
-
-while step < config.total_steps:
-    optimizer.zero_grad(set_to_none=True)
-    accum_loss, accum_acc = 0.0, 0.0
-    for _ in range(config.grad_accum):
-        try:
-            batch = next(train_iter)
-        except StopIteration:
-            train_iter = iter(train_loader)
-            batch = next(train_iter)
-        l, a = run_micro_batch(batch)
-        accum_loss += l; accum_acc += a
-    accum_loss /= config.grad_accum
-    accum_acc  /= config.grad_accum
-
-    lr_now = lr_at_step(step)
-    for pg in optimizer.param_groups:
-        pg["lr"] = lr_now
-
-    # Unscale so we can clip; then take the step.
-    scaler.unscale_(optimizer)
-    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-    scaler.step(optimizer)
-    scaler.update()
-
-    step += 1; pbar.update(1)
-    running_loss += accum_loss; running_acc += accum_acc; n_log += 1
-
-    if step % config.log_every == 0:
-        avg_loss = running_loss / n_log
-        avg_acc  = running_acc  / n_log
-        history["step"].append(step); history["loss"].append(avg_loss)
-        history["acc"].append(avg_acc); history["lr"].append(lr_now)
-        pbar.set_postfix(loss=f"{avg_loss:.3f}", acc=f"{avg_acc:.3f}", lr=f"{lr_now:.1e}")
-        running_loss, running_acc, n_log = 0.0, 0.0, 0
-
-    if step % config.ckpt_every == 0 or step == config.total_steps:
-        torch.save({
-            "step": step,
-            "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "scaler": scaler.state_dict(),
-            "history": history,
-        }, latest_ckpt)
-
-pbar.close()
-print("\nTraining complete.")
-
-
-best_ckpt = CKPT_DIR / f"{config.input_type}_h{config.num_heads}_best.pt"
-torch.save({"step": step, "model": model.state_dict(), "history": history}, best_ckpt)
-print(f"Saved best checkpoint to {best_ckpt}")
 
 
 @torch.no_grad()
